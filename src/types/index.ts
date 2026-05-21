@@ -2,7 +2,6 @@ export interface SpeedPost {
   id: string;
   device_id: string;
   hotel_name: string;
-  place_type: 'Hotel' | 'Motel' | 'Hostel' | 'Airbnb' | 'Resort' | 'Other';
   download_speed: number;
   upload_speed: number;
   ping_ms: number;
@@ -10,8 +9,6 @@ export interface SpeedPost {
   longitude: number;
   created_at: string;
 }
-
-export type PlaceType = SpeedPost['place_type'];
 
 export type SpeedTestStatus =
   | { kind: 'idle' }

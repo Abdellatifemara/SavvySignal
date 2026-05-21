@@ -27,7 +27,7 @@ export function SpeedCard({ post, isOwn = false }: Props) {
     <View style={[styles.card, isOwn && styles.ownCard]}>
       <View style={styles.header}>
         <View style={[styles.badge, { backgroundColor: color + '20' }]}>
-          <Text style={[styles.badgeText, { color }]}>{post.place_type.toUpperCase()}</Text>
+          <Text style={[styles.badgeText, { color }]}>HOTEL</Text>
         </View>
         <View style={styles.row}>
           {isOwn && (

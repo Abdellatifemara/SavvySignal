@@ -1,11 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
-  TextInput,
   TouchableOpacity,
   ScrollView,
+  FlatList,
   Alert,
   ActivityIndicator,
 } from 'react-native';
@@ -16,98 +16,164 @@ import { supabase } from '../lib/supabase';
 import { getDeviceId } from '../lib/deviceId';
 import { runSpeedTest } from '../lib/speedTest';
 import { SpeedMeter } from '../components/SpeedMeter';
-import { SpeedTestStatus, PlaceType } from '../types';
+import { SpeedTestStatus } from '../types';
 import { colors, radius, font } from '../theme';
 
-const PLACE_TYPES: PlaceType[] = ['Hotel', 'Motel', 'Hostel', 'Airbnb', 'Resort', 'Other'];
+interface NearbyPlace {
+  id: number;
+  name: string;
+  latitude: number;
+  longitude: number;
+  city: string | null;
+  country: string | null;
+  distance_m: number;
+}
 
-const RATE_LIMIT_KEY = 'rate_limit_';
+function distanceLabel(m: number) {
+  if (m < 1000) return `${Math.round(m)}m`;
+  return `${(m / 1000).toFixed(1)}km`;
+}
+
+const GEOFENCE_RADIUS = 300; // must be within 300m to post
 
 export function PostScreen() {
-  const [hotelName, setHotelName] = useState('');
-  const [placeType, setPlaceType] = useState<PlaceType>('Hotel');
-  const [speedStatus, setSpeedStatus] = useState<SpeedTestStatus>({ kind: 'idle' });
+  const [location, setLocation] = useState<Location.LocationObject | null>(null);
   const [locationGranted, setLocationGranted] = useState(false);
+  const [nearbyPlaces, setNearbyPlaces] = useState<NearbyPlace[]>([]);
+  const [loadingPlaces, setLoadingPlaces] = useState(false);
+  const [selectedPlace, setSelectedPlace] = useState<NearbyPlace | null>(null);
+  const [speedStatus, setSpeedStatus] = useState<SpeedTestStatus>({ kind: 'idle' });
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      setLocationGranted(status === 'granted');
+      if (status !== 'granted') return;
+      setLocationGranted(true);
+      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      setLocation(loc);
+      loadNearbyPlaces(loc.coords.latitude, loc.coords.longitude);
     })();
   }, []);
 
-  const startTest = async () => {
-    if (!locationGranted) {
-      Alert.alert('Location Required', 'We need your location to verify you\'re at the property.');
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return;
-      setLocationGranted(true);
+  const loadNearbyPlaces = useCallback(async (lat: number, lng: number) => {
+    setLoadingPlaces(true);
+    try {
+      const { data, error } = await supabase.rpc('nearby_places', {
+        user_lat: lat,
+        user_lng: lng,
+        radius_m: 2000,
+        max_results: 30,
+      });
+      if (error) throw error;
+      setNearbyPlaces(data ?? []);
+    } catch (err) {
+      console.error('Failed to load nearby places:', err);
+    } finally {
+      setLoadingPlaces(false);
     }
+  }, []);
+
+  const refreshLocation = async () => {
+    setLoadingPlaces(true);
+    setSelectedPlace(null);
+    setSpeedStatus({ kind: 'idle' });
+    try {
+      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      setLocation(loc);
+      await loadNearbyPlaces(loc.coords.latitude, loc.coords.longitude);
+    } catch {
+      setLoadingPlaces(false);
+    }
+  };
+
+  const selectPlace = (place: NearbyPlace) => {
+    if (place.distance_m > GEOFENCE_RADIUS) {
+      Alert.alert(
+        'Not Close Enough',
+        `You need to be within ${GEOFENCE_RADIUS}m of ${place.name} to check in. You're currently ${distanceLabel(place.distance_m)} away.`
+      );
+      return;
+    }
+    setSelectedPlace(place);
+    setSpeedStatus({ kind: 'idle' });
+  };
+
+  const startTest = async () => {
     setSpeedStatus({ kind: 'pinging' });
     await runSpeedTest(setSpeedStatus);
   };
 
-  const resetTest = () => setSpeedStatus({ kind: 'idle' });
-
-  const canPost = hotelName.trim().length >= 2 && speedStatus.kind === 'done';
+  const canPost = selectedPlace !== null && speedStatus.kind === 'done';
 
   const handlePost = async () => {
-    if (!canPost || speedStatus.kind !== 'done') return;
+    if (!canPost || speedStatus.kind !== 'done' || !selectedPlace || !location) return;
 
     setSubmitting(true);
     try {
-      // Get GPS
-      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
       const deviceId = await getDeviceId();
 
-      // Anti-abuse: check duplicate in last 24h for same device + similar hotel name
+      // Fresh location check — still in range?
+      const freshLoc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const dist = getDistance(freshLoc.coords.latitude, freshLoc.coords.longitude, selectedPlace.latitude, selectedPlace.longitude);
+      if (dist > GEOFENCE_RADIUS) {
+        Alert.alert('Out of Range', `You've moved too far from ${selectedPlace.name}.`);
+        return;
+      }
+
+      // Duplicate check
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
       const { data: recent } = await supabase
         .from('speed_posts')
-        .select('hotel_name')
+        .select('place_id')
         .eq('device_id', deviceId)
+        .eq('place_id', selectedPlace.id)
         .gte('created_at', since);
 
-      const duplicate = recent?.some(
-        r => r.hotel_name.toLowerCase() === hotelName.trim().toLowerCase()
-      );
-      if (duplicate) {
-        Alert.alert('Already Posted', 'You\'ve already checked in here in the last 24 hours.');
+      if (recent && recent.length > 0) {
+        Alert.alert('Already Posted', 'You already checked in here in the last 24 hours.');
         return;
       }
 
       const { error } = await supabase.from('speed_posts').insert({
         device_id: deviceId,
-        hotel_name: hotelName.trim(),
-        place_type: placeType,
+        place_id: selectedPlace.id,
+        hotel_name: selectedPlace.name,
         download_speed: speedStatus.downloadMbps,
         upload_speed: speedStatus.uploadMbps,
         ping_ms: speedStatus.pingMs,
-        latitude: loc.coords.latitude,
-        longitude: loc.coords.longitude,
+        latitude: freshLoc.coords.latitude,
+        longitude: freshLoc.coords.longitude,
       });
 
       if (error) throw error;
 
-      Alert.alert('Posted!', 'Your speed check-in has been saved.', [
-        {
-          text: 'OK',
-          onPress: () => {
-            setHotelName('');
-            setSpeedStatus({ kind: 'idle' });
-          },
-        },
+      Alert.alert('Posted!', `Speed check-in saved for ${selectedPlace.name}.`, [
+        { text: 'OK', onPress: () => { setSelectedPlace(null); setSpeedStatus({ kind: 'idle' }); } },
       ]);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      Alert.alert('Error', msg);
+      Alert.alert('Error', err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setSubmitting(false);
     }
   };
 
   const done = speedStatus.kind === 'done';
+
+  if (!locationGranted) {
+    return (
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <View style={styles.center}>
+          <Ionicons name="location-outline" size={48} color={colors.textMuted} />
+          <Text style={styles.emptyTitle}>Location Required</Text>
+          <Text style={styles.emptyText}>SavvySignal needs your location to find nearby hotels and verify check-ins.</Text>
+          <TouchableOpacity style={styles.testBtn} onPress={() => Location.requestForegroundPermissionsAsync()}>
+            <Text style={styles.testBtnText}>Grant Location Access</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -117,300 +183,208 @@ export function PostScreen() {
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
-        <Text style={styles.title}>Speed Check-In</Text>
-        <Text style={styles.subtitle}>Test the WiFi, post your results, help fellow travelers.</Text>
-
-        {/* Hotel Name */}
-        <View style={styles.card}>
-          <Text style={styles.cardLabel}>PROPERTY</Text>
-          <TextInput
-            style={styles.input}
-            value={hotelName}
-            onChangeText={setHotelName}
-            placeholder="e.g. Hilton Garden Inn Manhattan"
-            placeholderTextColor={colors.textMuted}
-            maxLength={100}
-          />
-          <View style={styles.typeRow}>
-            {PLACE_TYPES.map(t => (
-              <TouchableOpacity
-                key={t}
-                style={[styles.typeChip, placeType === t && styles.typeChipActive]}
-                onPress={() => setPlaceType(t)}
-              >
-                <Text style={[styles.typeText, placeType === t && styles.typeTextActive]}>{t}</Text>
-              </TouchableOpacity>
-            ))}
+        {/* Header */}
+        <View style={styles.headerRow}>
+          <View>
+            <Text style={styles.title}>Speed Check-In</Text>
+            <Text style={styles.subtitle}>Select your hotel, run the test, post.</Text>
           </View>
+          <TouchableOpacity onPress={refreshLocation} style={styles.refreshBtn}>
+            <Ionicons name="refresh" size={18} color={colors.primary} />
+          </TouchableOpacity>
         </View>
 
-        {/* Speed Test */}
+        {/* Nearby places */}
         <View style={styles.card}>
-          <Text style={styles.cardLabel}>WIFI SPEED TEST</Text>
+          <Text style={styles.cardLabel}>NEARBY HOTELS</Text>
 
-          {speedStatus.kind === 'idle' && (
-            <TouchableOpacity style={styles.testBtn} onPress={startTest}>
-              <Ionicons name="wifi" size={18} color="#fff" />
-              <Text style={styles.testBtnText}>Run Speed Test</Text>
-            </TouchableOpacity>
-          )}
-
-          {speedStatus.kind === 'pinging' && (
-            <View style={styles.testingWrap}>
-              <ActivityIndicator color={colors.primary} />
-              <Text style={styles.testingText}>Pinging nearest server...</Text>
+          {loadingPlaces ? (
+            <View style={styles.loadingRow}>
+              <ActivityIndicator color={colors.primary} size="small" />
+              <Text style={styles.loadingText}>Finding nearby places...</Text>
             </View>
-          )}
-
-          {speedStatus.kind === 'downloading' && (
-            <View style={styles.meterWrap}>
-              <SpeedMeter
-                speedMbps={speedStatus.speedMbps}
-                progress={speedStatus.progress}
-                label="DOWNLOADING"
-                color={colors.primary}
-              />
+          ) : nearbyPlaces.length === 0 ? (
+            <View style={styles.emptyRow}>
+              <Ionicons name="search-outline" size={20} color={colors.textMuted} />
+              <Text style={styles.emptyRowText}>No hotels found nearby. Try moving closer or refresh.</Text>
             </View>
+          ) : (
+            nearbyPlaces.map(place => {
+              const inRange = place.distance_m <= GEOFENCE_RADIUS;
+              const isSelected = selectedPlace?.id === place.id;
+              return (
+                <TouchableOpacity
+                  key={place.id}
+                  style={[styles.placeRow, isSelected && styles.placeRowSelected, !inRange && styles.placeRowFar]}
+                  onPress={() => selectPlace(place)}
+                >
+                  <View style={styles.placeInfo}>
+                    <Text style={[styles.placeName, !inRange && styles.placeNameFar]} numberOfLines={1}>
+                      {place.name}
+                    </Text>
+                    {place.city && (
+                      <Text style={styles.placeCity}>{place.city}{place.country ? `, ${place.country}` : ''}</Text>
+                    )}
+                  </View>
+                  <View style={styles.placeRight}>
+                    <Text style={[styles.placeDist, inRange ? styles.placeDistNear : styles.placeDistFar]}>
+                      {distanceLabel(place.distance_m)}
+                    </Text>
+                    {inRange && <Ionicons name="checkmark-circle" size={14} color={colors.green} />}
+                  </View>
+                </TouchableOpacity>
+              );
+            })
           )}
+        </View>
 
-          {speedStatus.kind === 'uploading' && (
-            <View style={styles.meterWrap}>
-              <SpeedMeter
-                speedMbps={speedStatus.speedMbps}
-                progress={speedStatus.progress}
-                label="UPLOADING"
-                color={colors.green}
-              />
+        {/* Speed test — only show when place selected */}
+        {selectedPlace && (
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>WIFI SPEED TEST</Text>
+            <View style={styles.selectedBadge}>
+              <Ionicons name="location" size={13} color={colors.green} />
+              <Text style={styles.selectedName}>{selectedPlace.name}</Text>
             </View>
-          )}
 
-          {done && (
-            <View style={styles.resultsWrap}>
-              <View style={styles.resultsRow}>
-                <View style={styles.resultItem}>
-                  <Text style={styles.resultLabel}>PING</Text>
-                  <Text style={styles.resultValue}>{speedStatus.pingMs} ms</Text>
-                </View>
-                <View style={styles.resultItem}>
-                  <Text style={[styles.resultLabel, { color: colors.primary }]}>DOWNLOAD</Text>
-                  <Text style={[styles.resultValue, { color: colors.primary }]}>
-                    {speedStatus.downloadMbps} Mbps
-                  </Text>
-                </View>
-                <View style={styles.resultItem}>
-                  <Text style={[styles.resultLabel, { color: colors.green }]}>UPLOAD</Text>
-                  <Text style={[styles.resultValue, { color: colors.green }]}>
-                    {speedStatus.uploadMbps} Mbps
-                  </Text>
-                </View>
+            {speedStatus.kind === 'idle' && (
+              <TouchableOpacity style={styles.testBtn} onPress={startTest}>
+                <Ionicons name="wifi" size={18} color="#fff" />
+                <Text style={styles.testBtnText}>Run Speed Test</Text>
+              </TouchableOpacity>
+            )}
+
+            {speedStatus.kind === 'pinging' && (
+              <View style={styles.testingWrap}>
+                <ActivityIndicator color={colors.primary} />
+                <Text style={styles.testingText}>Pinging nearest server...</Text>
               </View>
-              {speedStatus.simulated && (
-                <Text style={styles.simNote}>⚠ Simulated — no internet connection detected</Text>
-              )}
-              <TouchableOpacity onPress={resetTest} style={styles.retestBtn}>
-                <Text style={styles.retestText}>Re-run test</Text>
-              </TouchableOpacity>
-            </View>
-          )}
+            )}
 
-          {speedStatus.kind === 'error' && (
-            <View style={styles.testingWrap}>
-              <Ionicons name="alert-circle" size={24} color={colors.red} />
-              <Text style={styles.errorText}>{speedStatus.message}</Text>
-              <TouchableOpacity onPress={startTest} style={styles.retestBtn}>
-                <Text style={styles.retestText}>Try again</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-        </View>
+            {speedStatus.kind === 'downloading' && (
+              <View style={styles.meterWrap}>
+                <SpeedMeter speedMbps={speedStatus.speedMbps} progress={speedStatus.progress} label="DOWNLOADING" color={colors.primary} />
+              </View>
+            )}
 
-        {/* Location note */}
-        <View style={styles.locationNote}>
-          <Ionicons
-            name={locationGranted ? 'location' : 'location-outline'}
-            size={13}
-            color={locationGranted ? colors.green : colors.textMuted}
-          />
-          <Text style={styles.locationText}>
-            {locationGranted
-              ? 'Location will be attached to verify your check-in'
-              : 'Location permission needed to post'}
-          </Text>
-        </View>
+            {speedStatus.kind === 'uploading' && (
+              <View style={styles.meterWrap}>
+                <SpeedMeter speedMbps={speedStatus.speedMbps} progress={speedStatus.progress} label="UPLOADING" color={colors.green} />
+              </View>
+            )}
+
+            {done && (
+              <View style={styles.resultsWrap}>
+                <View style={styles.resultsRow}>
+                  <View style={styles.resultItem}>
+                    <Text style={styles.resultLabel}>PING</Text>
+                    <Text style={styles.resultValue}>{speedStatus.pingMs} ms</Text>
+                  </View>
+                  <View style={styles.resultItem}>
+                    <Text style={[styles.resultLabel, { color: colors.primary }]}>DOWNLOAD</Text>
+                    <Text style={[styles.resultValue, { color: colors.primary }]}>{speedStatus.downloadMbps} Mbps</Text>
+                  </View>
+                  <View style={styles.resultItem}>
+                    <Text style={[styles.resultLabel, { color: colors.green }]}>UPLOAD</Text>
+                    <Text style={[styles.resultValue, { color: colors.green }]}>{speedStatus.uploadMbps} Mbps</Text>
+                  </View>
+                </View>
+                {speedStatus.simulated && (
+                  <Text style={styles.simNote}>⚠ Simulated — no internet detected</Text>
+                )}
+                <TouchableOpacity onPress={() => setSpeedStatus({ kind: 'idle' })} style={styles.retestBtn}>
+                  <Text style={styles.retestText}>Re-run test</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {speedStatus.kind === 'error' && (
+              <View style={styles.testingWrap}>
+                <Ionicons name="alert-circle" size={24} color={colors.red} />
+                <Text style={styles.errorText}>{speedStatus.message}</Text>
+                <TouchableOpacity onPress={startTest} style={styles.retestBtn}>
+                  <Text style={styles.retestText}>Try again</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        )}
 
         {/* Submit */}
-        <TouchableOpacity
-          style={[styles.submitBtn, (!canPost || submitting) && styles.submitBtnDisabled]}
-          onPress={handlePost}
-          disabled={!canPost || submitting}
-        >
-          {submitting ? (
-            <ActivityIndicator color="#fff" size="small" />
-          ) : (
-            <>
-              <Ionicons name="cloud-upload" size={18} color="#fff" />
-              <Text style={styles.submitText}>Post Check-In</Text>
-            </>
-          )}
-        </TouchableOpacity>
+        {canPost && (
+          <TouchableOpacity
+            style={[styles.submitBtn, submitting && styles.submitBtnDisabled]}
+            onPress={handlePost}
+            disabled={submitting}
+          >
+            {submitting ? (
+              <ActivityIndicator color="#fff" size="small" />
+            ) : (
+              <>
+                <Ionicons name="cloud-upload" size={18} color="#fff" />
+                <Text style={styles.submitText}>Post Check-In</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
+}
+
+function getDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
   scroll: { flex: 1 },
   content: { padding: 16, paddingBottom: 40, gap: 12 },
-  title: {
-    fontSize: font.xxl,
-    fontWeight: '900',
-    color: colors.textPrimary,
-    letterSpacing: -0.5,
-  },
-  subtitle: {
-    fontSize: font.sm,
-    color: colors.textMuted,
-    marginBottom: 4,
-  },
-  card: {
-    backgroundColor: colors.surface,
-    borderRadius: radius.xl,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: colors.border,
-    gap: 10,
-  },
-  cardLabel: {
-    fontSize: font.xs,
-    fontWeight: '800',
-    color: colors.primary,
-    letterSpacing: 0.8,
-  },
-  input: {
-    backgroundColor: colors.bg,
-    borderRadius: radius.md,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    color: colors.textPrimary,
-    fontSize: font.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  typeRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
-  typeChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: radius.full,
-    backgroundColor: colors.bg,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  typeChipActive: {
-    backgroundColor: colors.primary,
-    borderColor: colors.primary,
-  },
-  typeText: {
-    fontSize: font.sm,
-    color: colors.textSecondary,
-    fontWeight: '600',
-  },
-  typeTextActive: { color: '#fff', fontWeight: '800' },
-  testBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    backgroundColor: colors.primary,
-    paddingVertical: 14,
-    borderRadius: radius.lg,
-  },
-  testBtnText: {
-    fontSize: font.md,
-    fontWeight: '800',
-    color: '#fff',
-  },
-  testingWrap: {
-    alignItems: 'center',
-    gap: 10,
-    paddingVertical: 16,
-  },
-  testingText: {
-    fontSize: font.sm,
-    color: colors.textSecondary,
-    fontWeight: '600',
-  },
-  errorText: {
-    fontSize: font.sm,
-    color: colors.red,
-    textAlign: 'center',
-  },
-  meterWrap: {
-    alignItems: 'center',
-    paddingVertical: 12,
-  },
+  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
+  title: { fontSize: font.xxl, fontWeight: '900', color: colors.textPrimary, letterSpacing: -0.5 },
+  subtitle: { fontSize: font.sm, color: colors.textMuted },
+  refreshBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: colors.border },
+  card: { backgroundColor: colors.surface, borderRadius: radius.xl, padding: 16, borderWidth: 1, borderColor: colors.border, gap: 10 },
+  cardLabel: { fontSize: font.xs, fontWeight: '800', color: colors.primary, letterSpacing: 0.8 },
+  loadingRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 },
+  loadingText: { fontSize: font.sm, color: colors.textMuted },
+  emptyRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 },
+  emptyRowText: { fontSize: font.sm, color: colors.textMuted, flex: 1 },
+  placeRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 12, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border },
+  placeRowSelected: { borderColor: colors.green, backgroundColor: colors.greenBg },
+  placeRowFar: { opacity: 0.55 },
+  placeInfo: { flex: 1 },
+  placeName: { fontSize: font.md, fontWeight: '700', color: colors.textPrimary },
+  placeNameFar: { color: colors.textSecondary },
+  placeCity: { fontSize: font.xs, color: colors.textMuted, marginTop: 2 },
+  placeRight: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  placeDist: { fontSize: font.xs, fontWeight: '700' },
+  placeDistNear: { color: colors.green },
+  placeDistFar: { color: colors.textMuted },
+  selectedBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.greenBg, paddingHorizontal: 10, paddingVertical: 6, borderRadius: radius.md },
+  selectedName: { fontSize: font.sm, color: colors.green, fontWeight: '700', flex: 1 },
+  testBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: colors.primary, paddingVertical: 14, borderRadius: radius.lg },
+  testBtnText: { fontSize: font.md, fontWeight: '800', color: '#fff' },
+  testingWrap: { alignItems: 'center', gap: 10, paddingVertical: 16 },
+  testingText: { fontSize: font.sm, color: colors.textSecondary, fontWeight: '600' },
+  errorText: { fontSize: font.sm, color: colors.red, textAlign: 'center' },
+  meterWrap: { alignItems: 'center', paddingVertical: 12 },
   resultsWrap: { gap: 12 },
-  resultsRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-  },
+  resultsRow: { flexDirection: 'row', justifyContent: 'space-around' },
   resultItem: { alignItems: 'center', gap: 4 },
-  resultLabel: {
-    fontSize: font.xs,
-    color: colors.textMuted,
-    fontWeight: '800',
-    letterSpacing: 0.5,
-  },
-  resultValue: {
-    fontSize: font.md,
-    fontWeight: '900',
-    color: colors.textPrimary,
-  },
-  simNote: {
-    fontSize: font.xs,
-    color: colors.orange,
-    textAlign: 'center',
-    fontWeight: '600',
-  },
-  retestBtn: {
-    alignItems: 'center',
-    paddingVertical: 6,
-  },
-  retestText: {
-    fontSize: font.sm,
-    color: colors.primary,
-    fontWeight: '700',
-  },
-  locationNote: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  locationText: {
-    fontSize: font.xs,
-    color: colors.textMuted,
-    fontWeight: '600',
-  },
-  submitBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    backgroundColor: colors.primary,
-    paddingVertical: 16,
-    borderRadius: radius.lg,
-    marginTop: 4,
-  },
-  submitBtnDisabled: {
-    opacity: 0.4,
-  },
-  submitText: {
-    fontSize: font.lg,
-    fontWeight: '800',
-    color: '#fff',
-  },
+  resultLabel: { fontSize: font.xs, color: colors.textMuted, fontWeight: '800', letterSpacing: 0.5 },
+  resultValue: { fontSize: font.md, fontWeight: '900', color: colors.textPrimary },
+  simNote: { fontSize: font.xs, color: colors.orange, textAlign: 'center', fontWeight: '600' },
+  retestBtn: { alignItems: 'center', paddingVertical: 6 },
+  retestText: { fontSize: font.sm, color: colors.primary, fontWeight: '700' },
+  submitBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: colors.primary, paddingVertical: 16, borderRadius: radius.lg },
+  submitBtnDisabled: { opacity: 0.4 },
+  submitText: { fontSize: font.lg, fontWeight: '800', color: '#fff' },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32, gap: 12 },
+  emptyTitle: { fontSize: font.xl, fontWeight: '800', color: colors.textPrimary },
+  emptyText: { fontSize: font.sm, color: colors.textMuted, textAlign: 'center', lineHeight: 20 },
 });

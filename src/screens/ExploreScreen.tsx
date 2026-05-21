@@ -16,10 +16,8 @@ import { getDeviceId } from '../lib/deviceId';
 import { SpeedCard } from '../components/SpeedCard';
 import { PaywallModal } from '../components/PaywallModal';
 import { getSubscription, activatePremium } from '../lib/subscription';
-import { SpeedPost, PlaceType } from '../types';
+import { SpeedPost } from '../types';
 import { colors, radius, font } from '../theme';
-
-const PLACE_FILTERS: Array<PlaceType | 'All'> = ['All', 'Hotel', 'Motel', 'Hostel', 'Airbnb', 'Resort'];
 
 export function ExploreScreen() {
   const [posts, setPosts] = useState<SpeedPost[]>([]);
@@ -28,7 +26,6 @@ export function ExploreScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [search, setSearch] = useState('');
-  const [placeFilter, setPlaceFilter] = useState<PlaceType | 'All'>('All');
   const [showPaywall, setShowPaywall] = useState(false);
   const [myPostCount, setMyPostCount] = useState(0);
 
@@ -58,10 +55,6 @@ export function ExploreScreen() {
         query = query.limit(200);
       }
 
-      if (placeFilter !== 'All') {
-        query = query.eq('place_type', placeFilter);
-      }
-
       if (search.trim()) {
         query = query.ilike('hotel_name', `%${search.trim()}%`);
       }
@@ -84,7 +77,7 @@ export function ExploreScreen() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [placeFilter, search]);
+  }, [search]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -103,11 +96,7 @@ export function ExploreScreen() {
   const isDiscountUnlocked = myPostCount >= 10;
 
   const filtered = posts.filter(p => {
-    const matchSearch = search
-      ? p.hotel_name.toLowerCase().includes(search.toLowerCase())
-      : true;
-    const matchType = placeFilter === 'All' ? true : p.place_type === placeFilter;
-    return matchSearch && matchType;
+    return search ? p.hotel_name.toLowerCase().includes(search.toLowerCase()) : true;
   });
 
   return (
@@ -152,27 +141,6 @@ export function ExploreScreen() {
             </TouchableOpacity>
           )}
         </View>
-
-        {/* Place filter */}
-        <FlatList
-          data={PLACE_FILTERS}
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          keyExtractor={i => i}
-          style={styles.filterRow}
-          contentContainerStyle={{ gap: 8, paddingHorizontal: 16 }}
-          renderItem={({ item }) => {
-            const active = placeFilter === item;
-            return (
-              <TouchableOpacity
-                style={[styles.filterChip, active && styles.filterChipActive]}
-                onPress={() => setPlaceFilter(item as PlaceType | 'All')}
-              >
-                <Text style={[styles.filterText, active && styles.filterTextActive]}>{item}</Text>
-              </TouchableOpacity>
-            );
-          }}
-        />
 
         {/* Free banner */}
         {!isPremium && (
